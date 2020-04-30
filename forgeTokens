@@ -1,0 +1,307 @@
+
+module Token.Fungible where
+
+import           Language.PlutusTx
+import           Language.PlutusTx.Prelude
+import           Ledger
+
+import qualified Ledger.Ada                 as A
+import qualified Ledger.Value               as V
+import           Playground.Contract
+import           Wallet
+import           Playground.Contract (mkFunctions, printSchemas)
+import           Control.Monad              (void)
+import qualified Data.ByteString.Lazy.Char8 as C
+import qualified Data.Map                   as Map
+import qualified Data.Set                   as Set
+import qualified Data.Text                  as T
+
+data Fungible = Fungible
+    { name   :: TokenName -- (1)
+    , issuer :: PubKey    -- (2)
+    } deriving (Show, Generic, ToJSON, FromJSON, ToSchema)
+
+makeLift ''Fungible
+
+type FungibleValidator = () -> Integer -> PendingTx -> Bool
+
+validateFungible :: Fungible -> FungibleValidator
+validateFungible f () n tx =
+    case pendingTxOutputs tx of
+        [o] -> case pendingTxOutData o of
+            DataTxOut -> False
+            PubKeyTxOut key ->
+                   key == issuer f          -- (1)
+                && txSignedBy tx (issuer f) -- (2)
+                && pendingTxOutValue o == v -- (3)
+        _   -> False                        -- (4)
+  where
+    v :: Value                              -- (5)
+    v = V.singleton
+            (ownCurrencySymbol tx)          -- (6)
+            (name f)
+            n
+fungibleDataScript :: DataScript
+fungibleDataScript = DataScript $ lifted ()
+
+mkFungibleRedeemerValue :: Integer -> RedeemerScript
+mkFungibleRedeemerValue = RedeemerScript . lifted
+
+mkFungibleValidator :: Fungible -> ValidatorScript
+mkFungibleValidator = ValidatorScript
+  . applyScript $$(compileScript [|| validateFungible ||])
+  . lifted
+
+fungibleAddress :: Fungible -> Address
+fungibleAddress = scriptAddress . mkFungibleValidator
+
+fungibleSymbol :: Fungible -> CurrencySymbol
+fungibleSymbol f = case validatorScriptHash $ mkFungibleValidator f of
+  ValidatorHash h -> V.currencySymbol h
+
+
+fungibleValue :: Fungible -> Integer -> Value
+fungibleValue f = V.singleton (fungibleSymbol f) (name f)
+
+forge :: forall m. MonadWallet m
+      => String  -- token name
+      -> Integer -- quantity to forge
+      -> m ()
+forge n s = do
+
+    key <- ownPubKey
+    let f = Fungible
+            { name   = TokenName $ C.pack n
+            , issuer = key                                           -- (1)
+            }
+    logMsg $ T.pack $
+        "forging " ++ show s ++ " of " ++ show f
+    startWatching $ fungibleAddress f                                -- (2)
+
+    void $ createTxAndSubmit                                          -- (3)
+        defaultSlotRange
+        Set.empty
+        [ scriptTxOut
+            zero
+            (mkFungibleValidator f)
+            fungibleDataScript
+        ]
+
+    go f
+
+  where
+    go :: Fungible -> m ()
+    go f = do
+        t <- trigger
+        registerOnce t $ handler f
+
+    trigger :: m EventTrigger
+    trigger = do
+        sl <- slot
+        return $ slotRangeT $ intervalFrom $ sl + 1                  -- (4)
+
+    handler :: Fungible -> EventHandler m
+    handler f = EventHandler $ const $ do
+        outs <- outputsAt $ fungibleAddress f
+        case Map.keys outs of
+            (ref : _) -> do                                          -- (5)
+                let v = fungibleValue f s
+                signTxAndSubmit_ Tx
+                    { txInputs     = Set.singleton $ scriptTxIn
+                                        ref
+                                        (mkFungibleValidator f)
+                                        (mkFungibleRedeemerValue s)
+                    , txOutputs    = [pubKeyTxOut v $ issuer f]      -- (7)
+                    , txFee        = zero
+                    , txForge      = v                               -- (8)
+                    , txValidRange = defaultSlotRange
+                    , txSignatures = Map.empty
+                    --- , txData = Map.singleton (dataValueHash unitData) unitData
+                    }
+            _         -> go f     
+            
+            
+data Trade = Trade
+    { value1   :: Value  -- What the seller wants to trade.
+    , party1   :: PubKey -- The seller.
+    , value2   :: Value  -- What the buyer wants to pay.
+    , party2   :: PubKey -- The buyer.
+    , deadline :: Slot   -- The trade has to be done before this.
+    } deriving (Show, Generic, ToJSON, FromJSON, ToSchema)
+
+makeLift ''Trade
+data TradeAction = Execute | Reclaim
+    deriving Show
+
+makeLift ''TradeAction
+
+type TradeValidator = () -> TradeAction -> PendingTx -> Bool
+
+validateTrade :: Trade -> TradeValidator
+validateTrade t () Execute tx = case pendingTxOutputs tx of        -- (1)
+    [o1, o2] -> case (pendingTxOutData o1, pendingTxOutData o2) of -- (2)
+        (PubKeyTxOut key1, PubKeyTxOut key2) ->                    -- (3)
+               intervalTo (deadline t)                             -- (4)
+                    `contains` pendingTxValidRange tx
+            && key1 == party1 t                                    -- (5)
+            && key2 == party2 t                                    -- (6)
+            && pendingTxOutValue o1 == value2 t                    -- (7)
+            && pendingTxOutValue o2 == value1 t                    -- (8)
+        _                                    -> False
+    _        -> False
+validateTrade t () Reclaim tx = case pendingTxOutputs tx of
+    [o] -> case pendingTxOutData o of
+        PubKeyTxOut key ->
+               intervalFrom (deadline t)
+                    `contains` pendingTxValidRange tx
+            && (   (   key == party1 t
+                    && pendingTxOutValue o == value1 t)
+                || (   key == party2 t
+                    && pendingTxOutValue o == value2 t))
+        _               -> False
+    _   -> False
+
+mkTradeValidator :: Trade -> ValidatorScript
+mkTradeValidator =
+      ValidatorScript
+    . applyScript $$(compileScript [|| validateTrade ||])
+    . lifted
+
+tradeDataScript :: DataScript
+tradeDataScript = DataScript $ lifted ()
+
+mkTradeRedeemerValue :: TradeAction -> RedeemerScript
+mkTradeRedeemerValue = RedeemerScript . lifted
+
+tradeAddress :: Trade -> Address
+tradeAddress = scriptAddress . mkTradeValidator 
+
+sell :: forall m. MonadWallet m
+     => PubKey  -- currency issuer
+     -> String  -- currency name
+     -> Integer -- currency quantity
+     -> Value   -- price
+     -> PubKey  -- buyer
+     -> Slot    -- deadline
+     -> m ()
+sell i c n v2 p2 dl = do
+    let f  = Fungible
+                { issuer = i
+                , name   = TokenName $ C.pack c
+                }
+        v1 = fungibleValue f n
+    p1 <- ownPubKey
+    let t = Trade
+                { value1   = v1
+                , party1   = p1
+                , value2   = v2
+                , party2   = p2
+                , deadline = dl
+                }
+    logMsg $ T.pack $ "starting sale in " ++ show t
+
+    tx <- payToScript                               -- (1)
+        defaultSlotRange
+        (tradeAddress t)
+        v1
+        tradeDataScript
+    registerOnce (trigger1 t) (handler1 t)
+    registerOnce (trigger2 t) (handler2 t tx)
+
+  where
+    trigger1 :: Trade -> EventTrigger               -- (2)
+    trigger1 t =
+        fundsAtAddressGeqT
+            (tradeAddress t)
+            (value1 t <> value2 t)
+        `andT`
+        slotRangeT
+            (intervalTo $ deadline t)
+    trigger2 t =                                    -- (3)
+        fundsAtAddressGeqT
+            (tradeAddress t)
+            (value1 t)
+        `andT`
+        slotRangeT
+            (intervalFrom $ deadline t)
+
+    handler1 :: Trade -> EventHandler m             -- (4)
+    handler1 t = EventHandler $ const $ do
+        logMsg $ T.pack $ "executing " ++ show t
+        m <- outputsAt $ tradeAddress t
+        let ins  = Set.fromList
+                [ scriptTxIn
+                    r
+                    (mkTradeValidator t)
+                    (mkTradeRedeemerValue Execute)
+                | r <- Map.keys m
+                ]
+            outs =
+                [ pubKeyTxOut (value2 t) (party1 t)
+                , pubKeyTxOut (value1 t) (party2 t)
+                ]
+        void $ createTxAndSubmit
+            (intervalTo $ deadline t)
+            ins
+            outs
+
+    handler2 :: Trade -> Tx -> EventHandler m       -- (5)
+    handler2 t tx = EventHandler $ const $ do
+        logMsg $ T.pack $ "reclaiming " ++ show t
+        collectFromScriptTxn
+            (intervalFrom $ deadline t)
+            (mkTradeValidator t)
+            (mkTradeRedeemerValue Reclaim)
+            (hashTx tx)
+
+buy :: forall m. MonadWallet m
+    => PubKey  -- currency issuer
+    -> String  -- currency name
+    -> Integer -- currency quantity
+    -> PubKey  -- seller
+    -> Value   -- price
+    -> Slot    -- deadline
+    -> m ()
+buy i c n p1 v2 dl = do
+    let f  = Fungible
+                { issuer = i
+                , name   = TokenName $ C.pack c
+                }
+        v1 = fungibleValue f n
+    p2 <- ownPubKey
+    let t = Trade
+                { value1   = v1
+                , party1   = p1
+                , value2   = v2
+                , party2   = p2
+                , deadline = dl
+                }
+    logMsg $ T.pack $ "starting buy in " ++ show t
+
+    tx <- payToScript                              -- (1)
+        defaultSlotRange
+        (tradeAddress t)
+        v2
+        tradeDataScript
+    registerOnce (trigger t) (handler t tx)
+
+  where
+    trigger t =                                    -- (2)
+        fundsAtAddressGeqT
+            (tradeAddress t)
+            (value2 t)
+        `andT`
+        slotRangeT
+            (intervalFrom $ deadline t)
+
+    handler :: Trade -> Tx -> EventHandler m       -- (3)
+    handler t tx = EventHandler $ const $ do
+        logMsg $ T.pack $ "reclaiming " ++ show t
+        collectFromScriptTxn
+            (intervalFrom $ deadline t)
+            (mkTradeValidator t)
+            (mkTradeRedeemerValue Reclaim)
+            (hashTx tx)
+
+$(mkFunctions ['forge, 'sell, 'buy])
+
