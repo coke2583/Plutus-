@@ -1,7 +1,7 @@
 
 module Token.Fungible where
 
-import           Language.PlutusTx
+import           Language.PlutusTx 
 import           Language.PlutusTx.Prelude
 import           Ledger
 
@@ -17,30 +17,62 @@ import qualified Data.Set                   as Set
 import qualified Data.Text                  as T
 
 data Fungible = Fungible
-    { name   :: TokenName -- (1)
-    , issuer :: PubKey    -- (2)
+    { name   :: TokenName -- (1) The name of our currency (for example "Plutus").
+    , issuer :: PubKey    -- (2) The person who is allowed to forge this currency
     } deriving (Show, Generic, ToJSON, FromJSON, ToSchema)
 
 makeLift ''Fungible
 
 type FungibleValidator = () -> Integer -> PendingTx -> Bool
 
+-- The policy will never change, so for its data scripts, we can use the unit type ().
+
+-- A PendingTx value:
+-- ◦ Contains information about the current transaction
+--      ▪ inputs and outputs
+--      ▪ validity interval, etc.
+-- ◦ Also contains information about the ledger state, which is provided by the specific node
+-- doing the transaction validation
+-- A `PendingTx` contains the hashes of redeemer and data scripts of all of its inputs and outputs.
+
+-- We are now ready to write down the validation logic, i.e. the monetary policy of our currency:
 validateFungible :: Fungible -> FungibleValidator
-validateFungible f () n tx =
-    case pendingTxOutputs tx of
-        [o] -> case pendingTxOutData o of
-            DataTxOut -> False
-            PubKeyTxOut key ->
-                   key == issuer f          -- (1)
-                && txSignedBy tx (issuer f) -- (2)
-                && pendingTxOutValue o == v -- (3)
-        _   -> False                        -- (4)
+validateFungible f () n tx =                -- f = fungible, () = datascript, n = integer, tx=pendingTx
+    case pendingTxOutputs tx of             -- PendingTxOut Get the list of 'PendingTxOut' outputs of the pending transaction at a given script address
+                                            -- Why is this here?
+                                            -- To validate a transaction, we have to evaluate the validation script of each of
+                                            -- the transaction's inputs. The validation script sees the data of the
+                                            -- transaction output it validates, and the redeemer of the transaction input of
+                                            -- the transaction that consumes it.
+                                            -- In addition, the validation script also needs information on the transaction as
+                                            -- a whole (not just the output-input pair it is concerned with). This information
+                                            -- is provided by the `PendingTx` type. A `PendingTx` contains the hashes of
+                                            -- redeemer and data scripts of all of its inputs and outputs.
+        [o] -> case pendingTxOutData o of   -- This has 2 datatypes nested within it, DataTxOut + PubKeyTxOut
+            DataTxOut -> False              -- The data script of the pending transaction output 
+            PubKeyTxOut key ->              -- Pub key address
+                   key == issuer f          -- (1) The newly forged money must go to the currency issuer
+                && txSignedBy tx (issuer f) -- (2) The forging transaction must be signed by the currency issuer
+                && pendingTxOutValue o == v -- (3) The forged value must be the value indicated by the redeemer script.
+        _   -> False                        -- (4) We expect exactly one output.
   where
-    v :: Value                              -- (5)
+    v :: Value                              -- (5) The value corresponding to the redeemer script.
     v = V.singleton
-            (ownCurrencySymbol tx)          -- (6)
+            (ownCurrencySymbol tx)          -- (6) Similar to function ownHash, function ownCurrencySymbol gives us the CurrencySymbol that we are currently validating.
             (name f)
             n
+
+-- {- Note [Script types in pending transactions]
+-- To validate a transaction, we have to evaluate the validation script of each of
+-- the transaction's inputs. The validation script sees the data of the
+-- transaction output it validates, and the redeemer of the transaction input of
+-- the transaction that consumes it.
+-- In addition, the validation script also needs information on the transaction as
+-- a whole (not just the output-input pair it is concerned with). This information
+-- is provided by the `PendingTx` type. A `PendingTx` contains the hashes of
+-- redeemer and data scripts of all of its inputs and outputs.
+--}
+
 fungibleDataScript :: DataScript
 fungibleDataScript = DataScript $ lifted ()
 
