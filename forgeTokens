@@ -74,10 +74,10 @@ validateFungible f () n tx =                -- f = fungible, () = datascript, n 
 --}
 
 fungibleDataScript :: DataScript
-fungibleDataScript = DataScript $ lifted ()
+fungibleDataScript = DataScript $ lifted () --$ because it takes an argument(s)
 
 mkFungibleRedeemerValue :: Integer -> RedeemerScript
-mkFungibleRedeemerValue = RedeemerScript . lifted
+mkFungibleRedeemerValue = RedeemerScript . lifted -- . because it's a single argument
 
 mkFungibleValidator :: Fungible -> ValidatorScript
 mkFungibleValidator = ValidatorScript
@@ -91,7 +91,6 @@ fungibleSymbol :: Fungible -> CurrencySymbol
 fungibleSymbol f = case validatorScriptHash $ mkFungibleValidator f of
   ValidatorHash h -> V.currencySymbol h
 
-
 fungibleValue :: Fungible -> Integer -> Value
 fungibleValue f = V.singleton (fungibleSymbol f) (name f)
 
@@ -100,57 +99,56 @@ forge :: forall m. MonadWallet m
       -> Integer -- quantity to forge
       -> m ()
 forge n s = do
-
     key <- ownPubKey
     let f = Fungible
             { name   = TokenName $ C.pack n
             , issuer = key                                           -- (1)
             }
     logMsg $ T.pack $
-        "forging " ++ show s ++ " of " ++ show f
-    startWatching $ fungibleAddress f                                -- (2)
+        "forging " ++ show s ++ " of " ++ show f                     -- forging 5 of Fungible
+    startWatching $ fungibleAddress f                                -- (2) We need to watch the "monetary policy"-address of our currency in order to be able to detect when the first transaction has been accepted onto the blockchain. 
 
-    void $ createTxAndSubmit                                          -- (3)
+    void $ createTxAndSubmit                                          -- (3) The signature of createTxAndSubmit is WalletAPI m ⇒ SlotRange → Set.Set TxIn → [TxOut] → m Tx
         defaultSlotRange
-        Set.empty
-        [ scriptTxOut
-            zero
+        Set.empty                                                     -- a set of inputs = we dont have any
+        [ scriptTxOut                                                 -- scriptTxOut :: Value -> ValidatorScript -> DataScript -> TxOut
+            zero                                                      -- The first transaction has no inputs and zero value. All we need is a script output at the "monetary policy"-address
             (mkFungibleValidator f)
             fungibleDataScript
         ]
 
-    go f
+    go f                                                               -- Describes the condition to be true to go ahead with the forge, and then what to do to proceed with forge.
 
   where
     go :: Fungible -> m ()
     go f = do
         t <- trigger
-        registerOnce t $ handler f
+        registerOnce t $ handler f                                  -- registerOnce registers a trigger
 
-    trigger :: m EventTrigger
+    trigger :: m EventTrigger                                       -- The event trigger defines a condition
     trigger = do
         sl <- slot
-        return $ slotRangeT $ intervalFrom $ sl + 1                  -- (4)
+        return $ slotRangeT $ intervalFrom $ sl + 1                  -- (4) Condition here is that we simply wait for one slot.
 
-    handler :: Fungible -> EventHandler m
+    handler :: Fungible -> EventHandler m                            -- the event handler describes what to do once the condition becomes true.
     handler f = EventHandler $ const $ do
         outs <- outputsAt $ fungibleAddress f
         case Map.keys outs of
-            (ref : _) -> do                                          -- (5)
+            (ref : _) -> do                                          -- (5) The UTXO we need as input is on the blockchain.
                 let v = fungibleValue f s
                 signTxAndSubmit_ Tx
-                    { txInputs     = Set.singleton $ scriptTxIn
+                    { txInputs     = Set.singleton $ scriptTxIn      -- (6)  We use the UTXO created in the first step as input for the forging transaction
                                         ref
                                         (mkFungibleValidator f)
                                         (mkFungibleRedeemerValue s)
-                    , txOutputs    = [pubKeyTxOut v $ issuer f]      -- (7)
+                    , txOutputs    = [pubKeyTxOut v $ issuer f]      -- (7)  The forged value goes to the wallet owner.
                     , txFee        = zero
-                    , txForge      = v                               -- (8)
+                    , txForge      = v                               -- (8) Here we actually forge. 
                     , txValidRange = defaultSlotRange
                     , txSignatures = Map.empty
                     --- , txData = Map.singleton (dataValueHash unitData) unitData
                     }
-            _         -> go f     
+            _         -> go f                                         -- (9) If the transaction from the first step is not yet on the blockchain, we keep waiting.
             
             
 data Trade = Trade
