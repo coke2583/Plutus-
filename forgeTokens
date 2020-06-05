@@ -74,7 +74,7 @@ validateFungible f () n tx =                -- f = fungible, () = datascript, n 
 --}
 
 fungibleDataScript :: DataScript
-fungibleDataScript = DataScript $ lifted () --$ because it takes an argument(s)
+fungibleDataScript = DataScript $ lifted () 
 
 mkFungibleRedeemerValue :: Integer -> RedeemerScript
 mkFungibleRedeemerValue = RedeemerScript . lifted -- . because it's a single argument
